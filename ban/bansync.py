@@ -209,7 +209,8 @@ class BanSync(commands.Cog):
 
     async def sync_to_other_servers(self, main_guild: discord.Guild, user: discord.User, action: str, reason: Optional[str] = None, duration: Optional[int] = None):
         """
-        Synchronisiert eine Aktion zu allen anderen Servern.
+        Synchronisiert eine Aktion zu ALLEN anderen Servern.
+        Funktioniert mit beliebig vielen Servern (2, 3, 10, 100+).
         """
         sync_enabled = await self.config.sync_enabled()
         if not sync_enabled:
@@ -220,14 +221,20 @@ class BanSync(commands.Cog):
         if not sync_action:
             return
         
+        # Hole ALLE Server außer dem Hauptserver
         target_servers = [g for g in self.bot.guilds if g.id != main_guild.id]
         
-        results = {"success": 0, "failed": 0, "already": 0}
+        if not target_servers:
+            return
         
+        results = {"success": 0, "failed": 0, "already": 0, "not_member": 0}
+        
+        # Synchronisiere zu JEDEM anderen Server
         for guild in target_servers:
             try:
                 member = guild.get_member(user.id)
                 if member is None:
+                    results["not_member"] += 1
                     continue
                 
                 bot_member = guild.me
@@ -281,6 +288,7 @@ class BanSync(commands.Cog):
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         """
         Listener für Ban-Events.
+        Synchronisiert zu ALLEN anderen Servern (nicht nur bei 2 Servern).
         """
         main_server_id = await self.config.main_server_id()
         if main_server_id is None or guild.id != main_server_id:
@@ -292,6 +300,7 @@ class BanSync(commands.Cog):
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
         """
         Listener für Unban-Events.
+        Synchronisiert zu ALLEN anderen Servern.
         """
         main_server_id = await self.config.main_server_id()
         if main_server_id is None or guild.id != main_server_id:
@@ -303,15 +312,21 @@ class BanSync(commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """
         Listener für Kick-Events (Member Remove ohne Ban).
+        Synchronisiert zu ALLEN anderen Servern.
         """
         main_server_id = await self.config.main_server_id()
         if main_server_id is None or member.guild.id != main_server_id:
             return
         
         # Prüfen ob es ein Kick war (nicht durch Ban)
-        # Wir können nicht direkt unterscheiden, aber wir können prüfen ob der User gebannt ist
         try:
-            ban_entry = await member.guild.bans().find(lambda b: b.user.id == member.id)
+            bans = await member.guild.bans()
+            ban_entry = None
+            for ban in bans:
+                if ban.user.id == member.id:
+                    ban_entry = ban
+                    break
+            
             if ban_entry is None:
                 # Es war wahrscheinlich ein Kick
                 await self.sync_to_other_servers(member.guild, member.user, "kick")
@@ -322,6 +337,7 @@ class BanSync(commands.Cog):
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         """
         Listener für Timeout-Events.
+        Synchronisiert zu ALLEN anderen Servern.
         """
         main_server_id = await self.config.main_server_id()
         if main_server_id is None or before.guild.id != main_server_id:
