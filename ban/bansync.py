@@ -14,11 +14,16 @@ class BanSync(commands.Cog):
     """
     Synchronisiert Moderationsaktionen (Ban, Unban, Kick, Timeout) 
     von einem Hauptserver auf alle anderen Server des Bots.
+    
+    Funktionsweise:
+    - Nur der Hauptserver löst Synchronisation aus
+    - Alle anderen Server empfangen die synchronisierten Aktionen
+    - Funktioniert mit beliebig vielen Servern (2, 3, 10, 100+)
     """
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
+        self.config = Config.get_conf(self, identifier=9876543210, force_registration=True)
         
         default_global = {
             "main_server_id": None,
@@ -105,7 +110,7 @@ class BanSync(commands.Cog):
             return
         
         config_key = f"sync_{action}"
-        await self.config.set_raw(config_key, value=enabled)
+        await getattr(self.config, config_key).set(enabled)
         
         emoji = "✅" if enabled else "❌"
         action_display = action.capitalize()
@@ -217,7 +222,7 @@ class BanSync(commands.Cog):
             return
         
         action_config = f"sync_{action}"
-        sync_action = await self.config.raw.get(action_config, True)
+        sync_action = await getattr(self.config, action_config)()
         if not sync_action:
             return
         
@@ -233,7 +238,9 @@ class BanSync(commands.Cog):
         for guild in target_servers:
             try:
                 member = guild.get_member(user.id)
-                if member is None:
+                
+                # Bei Unban muss der User nicht im Server sein
+                if action != "unban" and member is None:
                     results["not_member"] += 1
                     continue
                 
@@ -264,19 +271,25 @@ class BanSync(commands.Cog):
                         results["failed"] += 1
                 
                 elif action == "kick":
-                    try:
-                        await member.kick(reason=reason or f"Sync-Kick von {main_guild.name}")
-                        results["success"] += 1
-                    except discord.errors.Forbidden:
-                        results["failed"] += 1
+                    if member:
+                        try:
+                            await member.kick(reason=reason or f"Sync-Kick von {main_guild.name}")
+                            results["success"] += 1
+                        except discord.errors.Forbidden:
+                            results["failed"] += 1
+                    else:
+                        results["not_member"] += 1
                 
                 elif action == "timeout":
-                    try:
-                        until = discord.utils.utcnow() + discord.utils.timedelta(seconds=duration) if duration else None
-                        await member.timeout(until, reason=reason or f"Sync-Timeout von {main_guild.name}")
-                        results["success"] += 1
-                    except discord.errors.Forbidden:
-                        results["failed"] += 1
+                    if member:
+                        try:
+                            until = discord.utils.utcnow() + discord.utils.timedelta(seconds=duration) if duration else None
+                            await member.timeout(until, reason=reason or f"Sync-Timeout von {main_guild.name}")
+                            results["success"] += 1
+                        except discord.errors.Forbidden:
+                            results["failed"] += 1
+                    else:
+                        results["not_member"] += 1
                 
             except Exception:
                 results["failed"] += 1
