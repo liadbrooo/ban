@@ -1,155 +1,160 @@
 import discord
 from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
-from typing import Optional
+from typing import Optional, List
+import logging
+
+log = logging.getLogger("red.sban")
 
 class SBan(commands.Cog):
-    """Synchronisiert Bans vom Hauptserver auf alle anderen Server."""
+    """Synchronisiert Bans vom Hauptserver automatisch auf alle anderen Server."""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
+        self.config = Config.get_conf(self, identifier=8765432109, force_registration=True)
         
         default_global = {
             "main_guild_id": None,
             "enabled": False,
             "sync_ban": True,
-            "sync_unban": False,
+            "sync_unban": True,
             "sync_kick": False,
             "sync_timeout": False
         }
         self.config.register_global(**default_global)
 
     async def cog_load(self):
-        # Listener für Member-Bans registrieren
-        self.bot.add_listener(self.on_member_ban, "on_member_ban")
-        self.bot.add_listener(self.on_member_unban, "on_member_unban")
-        # Hinweis: Kicks und Timeouts haben keine direkten Events in d.py, 
-        # sie müssten über Audit-Logs oder manuelle Commands gehandhabt werden.
-        # Für einfache Bans/Unbans reicht dies.
+        """Wird beim Laden des Cogs ausgeführt."""
+        log.info("SBan Cog wurde geladen.")
 
     async def cog_unload(self):
-        self.bot.remove_listener(self.on_member_ban, "on_member_ban")
-        self.bot.remove_listener(self.on_member_unban, "on_member_unban")
+        """Wird beim Entladen des Cogs ausgeführt."""
+        log.info("SBan Cog wurde entladen.")
 
-    async def sync_to_other_servers(self, member: discord.Member, action: str, reason: Optional[str] = None):
-        """Führt eine Aktion auf allen anderen Servern aus."""
-        main_guild_id = await self.config.main_guild_id()
-        enabled = await self.config.enabled()
-        
-        if not enabled or not main_guild_id:
-            return
+    async def is_main_guild(self, guild_id: int) -> bool:
+        """Prüft ob eine Guild-ID dem Hauptserver entspricht."""
+        main_id = await self.config.main_guild_id()
+        return main_id is not None and guild_id == main_id
 
-        # Prüfen, ob die Aktion synchronisiert werden soll
-        if action == "ban" and not await self.config.sync_ban():
-            return
-        if action == "unban" and not await self.config.sync_unban():
-            return
-        if action == "kick" and not await self.config.sync_kick():
-            return
-        if action == "timeout" and not await self.config.sync_timeout():
-            return
-
-        # Wenn das Event nicht vom Hauptserver kommt, ignorieren
-        if member.guild.id != main_guild_id:
-            return
-
-        target_guilds = [g for g in self.bot.guilds if g.id != main_guild_id]
-        
-        for guild in target_guilds:
-            try:
-                # Versuchen, das Mitglied im Zielserver zu finden (für Unban/Kick/Timeout relevant)
-                # Bei Ban ist das Mitglied evtl. schon nicht mehr da, wir brauchen nur die ID
-                target_member = None
-                try:
-                    target_member = await guild.fetch_member(member.id)
-                except discord.NotFound:
-                    # Mitglied ist nicht auf dem Server (z.B. schon gebannt oder nie dabei)
-                    if action == "unban" or action == "kick" or action == "timeout":
-                        continue # Kann nicht gekickt/entbannt werden wenn nicht da
-                    pass # Bei Ban können wir trotzdem bannen (falls er joinen würde)
-
-                if action == "ban":
-                    await guild.ban(discord.Object(id=member.id), reason=f"Synchronized Ban from {member.guild.name}: {reason}")
-                elif action == "unban" and target_member is None:
-                    # Wir versuchen es trotzdem mit der ID für den Fall, dass er gebannt ist
-                    await guild.unban(discord.Object(id=member.id), reason=f"Synchronized Unban from {member.guild.name}")
-                elif action == "kick" and target_member:
-                    await target_member.kick(reason=f"Synchronized Kick from {member.guild.name}: {reason}")
-                elif action == "timeout" and target_member:
-                    # Timeout für 10 Sekunden als Beispiel, müsste angepasst werden wenn spezifische Dauer nötig
-                    await target_member.timeout(discord.utils.utcnow(), reason=f"Synchronized Timeout from {member.guild.name}")
-                    
-            except discord.Forbidden:
-                print(f"Keine Berechtigung zum {action} in {guild.name}")
-            except discord.HTTPException as e:
-                print(f"Fehler beim {action} in {guild.name}: {e}")
-            except Exception as e:
-                print(f"Unbekannter Fehler beim {action} in {guild.name}: {e}")
+    async def get_target_guilds(self, exclude_guild_id: int) -> List[discord.Guild]:
+        """Gibt alle Server zurück, außer dem angegebenen."""
+        return [g for g in self.bot.guilds if g.id != exclude_guild_id]
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         """Wird ausgelöst, wenn ein User gebannt wird."""
-        # Erstelle ein pseudo-Member-Objekt für die Sync-Funktion
-        # Da wir im Event nur 'user' (User Objekt) haben, nicht 'member' (Member Objekt mit Guild)
-        # aber die Sync Funktion erwartet ein Member Objekt oder wir passen sie an.
-        # Einfacher: Wir rufen die Logik direkt hier auf oder passen sync_to_other_servers an.
+        # Prüfen ob dies der Hauptserver ist
+        if not await self.is_main_guild(guild.id):
+            return
         
-        main_guild_id = await self.config.main_guild_id()
-        if guild.id != main_guild_id:
+        # Prüfen ob Sync aktiviert ist
+        enabled = await self.config.enabled()
+        if not enabled:
             return
             
-        enabled = await self.config.enabled()
-        if not enabled or not await self.config.sync_ban():
+        sync_ban = await self.config.sync_ban()
+        if not sync_ban:
             return
 
-        # Synchronisiere Ban
-        await self.sync_ban_action(guild, user)
+        log.info(f"Ban erkannt auf {guild.name} für {user} (ID: {user.id}). Starte Synchronisation...")
+        await self._execute_sync_ban(guild, user)
 
-    async def sync_ban_action(self, guild: discord.Guild, user: discord.User, reason: Optional[str] = None):
-        """Führt den Ban auf anderen Servern aus."""
-        target_guilds = [g for g in self.bot.guilds if g.id != guild.id]
+    async def _execute_sync_ban(self, source_guild: discord.Guild, user: discord.User):
+        """Führt den Ban auf allen Ziel-Servern aus."""
+        target_guilds = await self.get_target_guilds(source_guild.id)
+        
+        if not target_guilds:
+            log.warning("Keine Ziel-Server für Synchronisation gefunden.")
+            return
+
+        success_count = 0
+        fail_count = 0
         
         for target_guild in target_guilds:
             try:
-                # Prüfen ob User schon gebannt ist
-                ban_entry = await target_guild.bans().find(user.id)
-                if ban_entry:
+                # Prüfen ob der User bereits gebannt ist
+                ban_list = await target_guild.bans()
+                is_banned = any(ban.user.id == user.id for ban in ban_list)
+                
+                if is_banned:
+                    log.debug(f"User {user.id} ist bereits gebannt auf {target_guild.name}")
                     continue
                 
-                await target_guild.ban(user, reason=f"Sync-Ban von {guild.name}: {reason}")
+                # Ban ausführen
+                await target_guild.ban(
+                    user, 
+                    reason=f"🔄 Auto-Sync-Ban von {source_guild.name} | User: {user} (ID: {user.id})"
+                )
+                success_count += 1
+                log.info(f"✅ Ban synchronisiert auf {target_guild.name} für {user}")
+                
             except discord.Forbidden:
-                pass
-            except Exception:
-                pass
+                fail_count += 1
+                log.error(f"❌ Keine Berechtigung zum Bannen auf {target_guild.name}")
+            except discord.HTTPException as e:
+                fail_count += 1
+                log.error(f"❌ HTTP-Fehler beim Bannen auf {target_guild.name}: {e}")
+            except Exception as e:
+                fail_count += 1
+                log.error(f"❌ Unbekannter Fehler beim Bannen auf {target_guild.name}: {type(e).__name__}: {e}")
+
+        log.info(f"Synchronisation abgeschlossen: {success_count} erfolgreich, {fail_count} fehlgeschlagen")
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
         """Wird ausgelöst, wenn ein User entbannt wird."""
-        main_guild_id = await self.config.main_guild_id()
-        if guild.id != main_guild_id:
+        # Prüfen ob dies der Hauptserver ist
+        if not await self.is_main_guild(guild.id):
+            return
+        
+        # Prüfen ob Sync aktiviert ist
+        enabled = await self.config.enabled()
+        if not enabled:
             return
             
-        enabled = await self.config.enabled()
-        if not enabled or not await self.config.sync_unban():
+        sync_unban = await self.config.sync_unban()
+        if not sync_unban:
             return
 
-        # Synchronisiere Unban
-        await self.sync_unban_action(guild, user)
+        log.info(f"Unban erkannt auf {guild.name} für {user} (ID: {user.id}). Starte Synchronisation...")
+        await self._execute_sync_unban(guild, user)
 
-    async def sync_unban_action(self, guild: discord.Guild, user: discord.User):
-        """Führt den Unban auf anderen Servern aus."""
-        target_guilds = [g for g in self.bot.guilds if g.id != guild.id]
+    async def _execute_sync_unban(self, source_guild: discord.Guild, user: discord.User):
+        """Führt den Unban auf allen Ziel-Servern aus."""
+        target_guilds = await self.get_target_guilds(source_guild.id)
+        
+        if not target_guilds:
+            log.warning("Keine Ziel-Server für Synchronisation gefunden.")
+            return
+
+        success_count = 0
+        fail_count = 0
         
         for target_guild in target_guilds:
             try:
-                await target_guild.unban(user, reason=f"Sync-Unban von {guild.name}")
+                # Unban ausführen (discord wirft keine Exception wenn nicht gebannt bei unban mit User-Objekt)
+                await target_guild.unban(
+                    user, 
+                    reason=f"🔄 Auto-Sync-Unban von {source_guild.name} | User: {user} (ID: {user.id})"
+                )
+                success_count += 1
+                log.info(f"✅ Unban synchronisiert auf {target_guild.name} für {user}")
+                
             except discord.NotFound:
-                pass # War nicht gebannt
+                # User war auf diesem Server nicht gebannt
+                log.debug(f"User {user.id} war auf {target_guild.name} nicht gebannt")
+                continue
             except discord.Forbidden:
-                pass
-            except Exception:
-                pass
+                fail_count += 1
+                log.error(f"❌ Keine Berechtigung zum Entbannen auf {target_guild.name}")
+            except discord.HTTPException as e:
+                fail_count += 1
+                log.error(f"❌ HTTP-Fehler beim Entbannen auf {target_guild.name}: {e}")
+            except Exception as e:
+                fail_count += 1
+                log.error(f"❌ Unbekannter Fehler beim Entbannen auf {target_guild.name}: {type(e).__name__}: {e}")
+
+        log.info(f"Unban-Synchronisation abgeschlossen: {success_count} erfolgreich, {fail_count} fehlgeschlagen")
 
     @commands.group(name="sban", aliases=["sb"])
     @checks.is_owner()
@@ -237,4 +242,7 @@ class SBan(commands.Cog):
 
 
 async def setup(bot: Red):
-    await bot.add_cog(SBan(bot))
+    """Lädt den SBan Cog."""
+    cog = SBan(bot)
+    await bot.add_cog(cog)
+    log.info("SBan Cog erfolgreich geladen.")
